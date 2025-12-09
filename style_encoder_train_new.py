@@ -14,7 +14,7 @@ import argparse
 import torch.optim as optim
 from tqdm import tqdm
 from utils.unhd_dataset import UNHDDataset  # Import the UNHD dataset
-from utils.auxilary_functions import affine_transformation
+from utils.auxilary_functions import affine_transformation, image_resize_PIL, centered_PIL
 from feature_extractor import ImageEncoder
 import timm
 import cv2
@@ -39,661 +39,13 @@ class AvgMeter:
         text = f"{self.name}: {self.avg:.4f}"
         return text
 
-class WordStyleDataset(Dataset):
-    def __init__(self, basefolder: str = 'datasets/',  # Root folder
-                 subset: str = 'all',  # Name of dataset subset to be loaded. (e.g. 'all', 'train', 'test', 'fold1', etc.)
-                 segmentation_level: str = 'line',  # Type of data to load ('line' or 'word')
-                 fixed_size: tuple = (128, None),  # Resize inputs to this size
-                 transforms: list = None,  # List of augmentation transform functions to be applied on each input
-                 character_classes: list = None,  # If 'None', these will be autocomputed. Otherwise, a list of characters is expected.
-                 ):
-        self.basefolder = basefolder
-        self.subset = subset
-        self.segmentation_level = segmentation_level
-        self.fixed_size = fixed_size
-        self.transforms = transforms
-        self.setname = None  # E.g. 'IAM'. This should coincide with the folder name
-        self.stopwords = []
-        self.stopwords_path = None
-        self.character_classes = character_classes
-        self.max_transcr_len = 0
-        self.data_file = './unhd_data/unhd_train_val_fixed.txt'
-        with open(self.data_file, 'r') as f:
-            lines = f.readlines()
-        self.data_info = [line.strip().split(',') for line in lines]
-
-    def __len__(self):
-        return len(self.data_info)
-
-    def __getitem__(self, index):
-        img = self.data_info[index][0]
-        img = Image.open(img).convert('RGB')
-        transcr = self.data_info[index][2]
-        wid = int(self.data_info[index][1])  # Convert to int
-        img_path = self.data_info[index][0]
-
-        # Pick another sample that has the same self.data[2] or same writer id
-        positive_samples = [p for p in self.data_info if int(p[1]) == wid and len(p[2]) > 3]
-        negative_samples = [n for n in self.data_info if int(n[1]) != wid and len(n[2]) > 3]
-
-        positive = random.choice(positive_samples)[0]
-        negative = random.choice(negative_samples)[0]
-
-        img_pos = Image.open(positive).convert('RGB')
-        img_neg = Image.open(negative).convert('RGB')
-
-        if img.height < 64 and img.width < 256:
-            img = img
-        else:
-            img = image_resize_PIL(img, height=img.height // 2)
-
-        if img_pos.height < 64 and img_pos.width < 256:
-            img_pos = img_pos
-        else:
-            img_pos = image_resize_PIL(img_pos, height=img_pos.height // 2)
-
-        if img_neg.height < 64 and img_neg.width < 256:
-            img_neg = img_neg
-        else:
-            img_neg = image_resize_PIL(img_neg, height=img_neg.height // 2)
-
-        fheight, fwidth = self.fixed_size[0], self.fixed_size[1]
-
-        if self.subset == 'train':
-            nwidth = int(np.random.uniform(.75, 1.25) * img.width)
-            nheight = int((np.random.uniform(.9, 1.1) * img.height / img.width) * nwidth)
-            nwidth_pos = int(np.random.uniform(.75, 1.25) * img_pos.width)
-            nheight_pos = int((np.random.uniform(.9, 1.1) * img_pos.height / img_pos.width) * nwidth_pos)
-            nwidth_neg = int(np.random.uniform(.75, 1.25) * img_neg.width)
-            nheight_neg = int((np.random.uniform(.9, 1.1) * img_neg.height / img_neg.width) * nwidth_neg)
-        else:
-            nheight, nwidth = img.height, img.width
-            nheight_pos, nwidth_pos = img_pos.height, img_pos.width
-            nheight_neg, nwidth_neg = img_neg.height, img_neg.width
-
-        nheight, nwidth = max(4, min(fheight-16, nheight)), max(8, min(fwidth-32, nwidth))
-        nheight_pos, nwidth_pos = max(4, min(fheight-16, nheight_pos)), max(8, min(fwidth-32, nwidth_pos))
-        nheight_neg, nwidth_neg = max(4, min(fheight-16, nheight_neg)), max(8, min(fwidth-32, nwidth_neg))
-
-        img = image_resize_PIL(img, height=int(1.0 * nheight), width=int(1.0 * nwidth))
-        img = centered_PIL(img, (fheight, fwidth), border_value=255.0)
-
-        img_pos = image_resize_PIL(img_pos, height=int(1.0 * nheight_pos), width=int(1.0 * nwidth_pos))
-        img_pos = centered_PIL(img_pos, (fheight, fwidth), border_value=255.0)
-
-        img_neg = image_resize_PIL(img_neg, height=int(1.0 * nheight_neg), width=int(1.0 * nwidth_neg))
-        img_neg = centered_PIL(img_neg, (fheight, fwidth), border_value=255.0)
-
-        if self.transforms is not None:
-            img = self.transforms(img)
-            img_pos = self.transforms(img_pos)
-            img_neg = self.transforms(img_neg)
-
-        return img, transcr, wid, img_pos, img_neg, img_path
-
-    def collate_fn(self, batch):
-        # Separate image tensors and caption tensors
-        img, transcr, wid, positive, negative, img_path = zip(*batch)
-        # Stack image tensors and caption tensors into batches
-        images_batch = torch.stack(img)
-        images_pos = torch.stack(positive)
-        images_neg = torch.stack(negative)
-        return images_batch, transcr, wid, images_pos, images_neg, img_path
-
-
-def image_resize_PIL(img, height=None, width=None):
-    if height is None and width is None:
-        return img  # No resizing needed
-
-    original_width, original_height = img.size
-
-    if height is not None and width is None:
-        scale = height / original_height
-        new_width = int(original_width * scale)
-        new_height = height
-    elif width is not None and height is None:
-        scale = width / original_width
-        new_width = width
-        new_height = int(original_height * scale)
-    else:
-        new_width = width
-        new_height = height
-
-    # Resize the image
-    resized_img = img.resize((new_width, new_height))
-    #resized_img.save('res.png')
-    return resized_img
-
-
-def centered_PIL(word_img, tsize, centering=(.5, .5), border_value=None):
-    
-    height = tsize[0]
-    width = tsize[1]
-    #print('word_img.size', word_img.size)
-    xs, ys, xe, ye = 0, 0, width, height
-    diff_h = height-word_img.height
-    if diff_h >= 0:
-        pv = int(centering[0] * diff_h)
-        padh = (pv, diff_h-pv)
-    else:
-        diff_h = abs(diff_h)
-        ys, ye = diff_h/2, word_img.height - (diff_h - diff_h/2)
-        padh = (0, 0)
-    diff_w = width - word_img.width
-    if diff_w >= 0:
-        pv = int(centering[1] * diff_w)
-        padw = (pv, diff_w - pv)
-    else:
-        diff_w = abs(diff_w)
-        xs, xe = diff_w / 2, word_img.width - (diff_w - diff_w / 2)
-        padw = (0, 0)
-
-    if border_value is None:
-        border_value = np.median(word_img)
-    
-    
-   
-    #print('word_img.size, padw, padh', word_img.size, padw, padh)
-    res = Image.new('RGB', (width, height), color = (255, 255, 255))
-    #res.save('background.png')
-    
-    res.paste(word_img, (padw[0], padh[0]))
-    
-    
-    return res
-
-class WordLineDataset(Dataset):
-    #
-    # TODO list:
-    #
-    #   Create method that will print data statistics (min/max pixel value, num of channels, etc.)   
-    '''
-    This class is a generic Dataset class meant to be used for word- and line- image datasets.
-    It should not be used directly, but inherited by a dataset-specific class.
-    '''
-    def __init__(self, 
-        basefolder: str = 'datasets/',                #Root folder
-        subset: str = 'all',                          #Name of dataset subset to be loaded. (e.g. 'all', 'train', 'test', 'fold1', etc.)
-        segmentation_level: str = 'line',             #Type of data to load ('line' or 'word')
-        fixed_size: tuple =(128, None),               #Resize inputs to this size
-        transforms: list = None,                      #List of augmentation transform functions to be applied on each input
-        character_classes: list = None,               #If 'None', these will be autocomputed. Otherwise, a list of characters is expected.
-        ):
-        
-        self.basefolder = basefolder
-        self.subset = subset
-        self.segmentation_level = segmentation_level
-        self.fixed_size = fixed_size
-        self.transforms = transforms
-        self.setname = None                             # E.g. 'IAM'. This should coincide with the folder name
-        self.stopwords = []
-        self.stopwords_path = None
-        self.character_classes = character_classes
-        self.max_transcr_len = 0
-        #self.processor = TrOCRProcessor.from_pretrained("microsoft/trocr-base-handwritten", )
-
-    def __finalize__(self):
-        '''
-        Will call code after descendant class has specified 'key' variables
-        and ran dataset-specific code
-        '''
-        assert(self.setname is not None)
-        if self.stopwords_path is not None:
-            for line in open(self.stopwords_path):
-                self.stopwords.append(line.strip().split(','))
-            self.stopwords = self.stopwords[0]
-        
-        save_path = './IAM_dataset_PIL_style'
-        if os.path.exists(save_path) is False:
-            os.makedirs(save_path, exist_ok=True)
-        save_file = '{}/{}_{}_{}.pt'.format(save_path, self.subset, self.segmentation_level, self.setname) #dataset_path + '/' + set + '_' + level + '_IAM.pt'
-        print('save_file', save_file)
-        #if isfile(save_file) is False:
-        #    data = self.main_loader(self.subset, self.segmentation_level)
-        #    torch.save(data, save_file)   #Uncomment this in 'release' version
-        #else:
-        #    data = torch.load(save_file)
-        
-        data = self.main_loader(self.subset, self.segmentation_level)
-        self.data = data
-        #print('data', self.data)
-        self.initial_writer_ids = [d[2] for d in data]
-        
-        writer_ids,_  = np.unique([d[2] for d in data], return_inverse=True)
-       
-        self.writer_ids = writer_ids
-        
-        self.wclasses = len(writer_ids)
-        print('Number of writers', self.wclasses)
-        if self.character_classes is None:
-            res = set()
-             #compute character classes given input transcriptions
-            for _,transcr,_,_ in tqdm(data):
-                #print('legth transcr = ', len(transcr))
-                res.update(list(transcr))
-                self.max_transcr_len = max(self.max_transcr_len, len(transcr))
-                #print('self.max_transcr_len', self.max_transcr_len)
-                
-            res = sorted(list(res))
-            res.append(' ')
-            print('Character classes: {} ({} different characters)'.format(res, len(res)))
-            print('Max transcription length: {}'.format(self.max_transcr_len))
-            self.character_classes = res
-            self.max_transcr_len = self.max_transcr_len
-        #END FINALIZE
-
-    def __len__(self):
-        return len(self.data)
-
-   
-    def __getitem__(self, index):
-        
-        img = self.data[index][0]
-        
-        transcr = self.data[index][1]
-
-        wid = self.data[index][2]
-
-        img_path = self.data[index][3]
-        #pick another sample that has the same self.data[2] or same writer id
-        positive_samples = [p for p in self.data if p[2] == wid and len(p[1])>3]
-        negative_samples = [n for n in self.data if n[2] != wid and len(n[1])>3]
-        
-        
-        positive = random.choice(positive_samples)[0]
-        
-        # Make sure you have at least 5 matching images
-        if len(positive_samples) >= 5:
-            # Randomly select 5 indices from the matching_indices
-            random_samples = random.sample(positive_samples, k=5)
-            # Retrieve the corresponding images
-            style_images = [i[0] for i in random_samples]
-        else:
-            # Handle the case where there are fewer than 5 matching images (if needed)
-            #print("Not enough matching images with writer ID", wid)
-            positive_samples_ = [p for p in self.data if p[2] == wid]
-            #print('len positive samples', len(positive_samples_), 'wid', wid)
-            random_samples_ = random.sample(positive_samples_, k=5)
-            # Retrieve the corresponding images
-            style_images = [i[0] for i in random_samples_]
-
-        #pick another image from a different writer
-        negative = random.choice(negative_samples)[0]
-
-        img_pos = positive #image_resize_PIL(positive, height=positive.height // 2)
-        img_neg = negative #image_resize_PIL(negative, height=negative.height // 2)
-        
-        fheight, fwidth = self.fixed_size[0], self.fixed_size[1]
-        #print('fheight', fheight, 'fwidth', fwidth)
-        if self.subset == 'train':
-            nwidth = int(np.random.uniform(.75, 1.25) * img.width)
-            nheight = int((np.random.uniform(.9, 1.1) * img.height / img.width) * nwidth)
-            
-            nwidth_pos = int(np.random.uniform(.75, 1.25) * img_pos.width)
-            nheight_pos = int((np.random.uniform(.9, 1.1) * img_pos.height / img_pos.width) * nwidth_pos)
-            
-            nwidth_neg = int(np.random.uniform(.75, 1.25) * img_neg.width)
-            nheight_neg = int((np.random.uniform(.9, 1.1) * img_neg.height / img_neg.width) * nwidth_neg)
-            
-        else:
-            nheight, nwidth = img.height, img.width
-            nheight_pos, nwidth_pos = img_pos.height, img_pos.width
-            nheight_neg, nwidth_neg = img_neg.height, img_neg.width
-            
-        nheight, nwidth = max(4, min(fheight-16, nheight)), max(8, min(fwidth-32, nwidth))
-        nheight_pos, nwidth_pos = max(4, min(fheight-16, nheight_pos)), max(8, min(fwidth-32, nwidth_pos))
-        nheight_neg, nwidth_neg = max(4, min(fheight-16, nheight_neg)), max(8, min(fwidth-32, nwidth_neg))
-        
-        #img = image_resize_PIL(img, height=int(1.0 * nheight), width=int(1.0 * nwidth))
-        #img = centered_PIL(img, (fheight, fwidth), border_value=None).convert('L')
-        
-            #image = image.resize((256, 64), Image.ANTIALIAS)
-        if img.width < 256:
-            img = ImageOps.pad(img, size=(256, 64), color= "white")#, centering=(0,0)) uncommment to pad right
-        #print('img', img.mode, img.size)
-        
-        pixel_values_img = img #self.processor(img, return_tensors="pt").pixel_values
-        pixel_values_img = pixel_values_img#.squeeze(0)
-
-        img_pos = image_resize_PIL(img_pos, height=int(1.0 * nheight_pos), width=int(1.0 * nwidth_pos))
-        img_pos = centered_PIL(img_pos, (fheight, fwidth), border_value=255.0)
-        
-        img_neg = image_resize_PIL(img_neg, height=int(1.0 * nheight_neg), width=int(1.0 * nwidth_neg))
-        img_neg = centered_PIL(img_neg, (fheight, fwidth), border_value=255.0)
-        
-        pixel_values_pos = img_pos #self.processor(img_pos, return_tensors="pt").pixel_values
-        pixel_values_neg = img_neg #self.processor(img_neg, return_tensors="pt").pixel_values
-        pixel_values_pos = pixel_values_pos#.squeeze(0)
-        
-        pixel_values_neg = pixel_values_neg#.squeeze(0)
-        
-        st_imgs = []
-        for s_im in style_images:
-            #s_im = image_resize_PIL(s_im, height=s_im.height // 2)
-            if self.subset == 'train':
-                nwidth = int(np.random.uniform(.75, 1.25) * s_im.width)
-                nheight = int((np.random.uniform(.9, 1.1) * s_im.height / s_im.width) * nwidth)
-                
-            else:
-                nheight, nwidth = s_im.height, s_im.width
-                
-            nheight, nwidth = max(4, min(fheight-16, nheight)), max(8, min(fwidth-32, nwidth))
-            # Load the image and transform it
-            s_img = image_resize_PIL(s_im, height=int(1.0 * nheight), width=int(1.0 * nwidth))
-            s_img = centered_PIL(s_img, (fheight, fwidth), border_value=255.0)
-            if self.transforms is not None:
-                s_img_tensor = self.transforms(img)
-            
-            st_imgs += [s_img_tensor]
-            
-        s_imgs = torch.stack(st_imgs)
-        
-        if self.transforms is not None:
-            
-            img = self.transforms(img)
-            img_pos = self.transforms(img_pos)
-            img_neg = self.transforms(img_neg)
-        
-        char_tokens = [self.character_classes.index(c) for c in transcr]
-        #print('char_tokens before', char_tokens)
-        pad_token = 79 
-        
-        #padding_length = self.max_transcr_len - len(char_tokens)
-        padding_length = 95 - len(char_tokens)
-        char_tokens.extend([pad_token] * padding_length)
-        
-        #char_tokens += [pad_token] * (self.max_transcr_len - len(char_tokens))
-        char_tokens = torch.tensor(char_tokens, dtype=torch.long)
-        
-        cla = self.character_classes
-        #print('character classes', cla)
-        #wid = self.wr_dict[index]
-        #print('wid after', index, wid)
-        #print('pixel_values_pos', pixel_values_pos.shape)
-        #img = outImg
-        #save_image(img, 'check_augm.png')
-        return img, transcr, char_tokens, wid, img_pos, img_neg, cla, s_imgs, img_path, img, img_pos, img_neg #pixel_values_img, pixel_values_pos, pixel_values_neg
-
-    def collate_fn(self, batch):
-        # Separate image tensors and caption tensors
-        img, transcr, char_tokens, wid, positive, negative, cla, s_imgs, img_path, pixel_values_img, pixel_values_pos, pixel_values_neg = zip(*batch)
-
-        # Stack image tensors and caption tensors into batches
-        images_batch = torch.stack(img)
-        #transcr_batch = torch.stack(transcr)
-        char_tokens_batch = torch.stack(char_tokens)
-        
-        images_pos = torch.stack(positive)
-        images_neg = torch.stack(negative)
-        
-        s_imgs = torch.stack(s_imgs)
-        
-        pixel_values_img = torch.stack(pixel_values_img)
-        
-        pixel_values_pos = torch.stack(pixel_values_pos)
-        pixel_values_neg = torch.stack(pixel_values_neg)
-        
-        return img, transcr, char_tokens_batch, wid, images_pos, images_neg, cla, s_imgs, img_path, pixel_values_img, pixel_values_pos, pixel_values_neg
-
-    
-    
-    def main_loader(self, subset, segmentation_level) -> list:
-        # This function should be implemented by an inheriting class.
-        raise NotImplementedError
-
-    def check_size(self, img, min_image_width_height, fixed_image_size=None):
-        '''
-        checks if the image accords to the minimum and maximum size requirements
-        or fixed image size and resizes if not
-        
-        :param img: the image to be checked
-        :param min_image_width_height: the minimum image size
-        :param fixed_image_size:
-        '''
-        if fixed_image_size is not None:
-            if len(fixed_image_size) != 2:
-                raise ValueError('The requested fixed image size is invalid!')
-            new_img = resize(image=img, output_shape=fixed_image_size[::-1], mode='constant')
-            new_img = new_img.astype(np.float32)
-            return new_img
-        elif np.amin(img.shape[:2]) < min_image_width_height:
-            if np.amin(img.shape[:2]) == 0:
-                print('OUCH')
-                return None
-            scale = float(min_image_width_height + 1) / float(np.amin(img.shape[:2]))
-            new_shape = (int(scale * img.shape[0]), int(scale * img.shape[1]))
-            new_img = resize(image=img, output_shape=new_shape, mode='constant')
-            new_img = new_img.astype(np.float32)
-            return new_img
-        else:
-            return img
-    
-    def print_random_sample(self, image, transcription, id, as_saved_files=True):
-        import random    #   Create method that will show example images using graphics-in-console (e.g. TerminalImageViewer)
-        from PIL import Image
-        # Run this with a very low probability
-        x = random.randint(0, 10000)
-        if(x > 5):
-            return
-        def show_image(img):
-            def get_ansi_color_code(r, g, b):
-                if r == g and g == b:
-                    if r < 8:
-                        return 16
-                    if r > 248:
-                        return 231
-                    return round(((r - 8) / 247) * 24) + 232
-                return 16 + (36 * round(r / 255 * 5)) + (6 * round(g / 255 * 5)) + round(b / 255 * 5)
-            def get_color(r, g, b):
-                return "\x1b[48;5;{}m \x1b[0m".format(int(get_ansi_color_code(r,g,b)))
-            h = 12
-            w = int((img.width / img.height) * h)
-            img = img.resize((w,h))
-            img_arr = np.asarray(img)
-            h,w  = img_arr.shape #,c
-            for x in range(h):
-                for y in range(w):
-                    pix = img_arr[x][y]
-                    print(get_color(pix, pix, pix), sep='', end='')
-                    #print(get_color(pix[0], pix[1], pix[2]), sep='', end='')
-                print()
-        if(as_saved_files):
-            Image.fromarray(np.uint8(image*255.)).save('/tmp/a{}_{}.png'.format(id, transcription))
-        else:
-            print('Id = {}, Transcription = "{}"'.format(id, transcription))
-            show_image(Image.fromarray(255.0*image))
-            print()
-
-class LineListIO(object):
-    '''
-    Helper class for reading/writing text files into lists.
-    The elements of the list are the lines in the text file.
-    '''
-    @staticmethod
-    def read_list(filepath, encoding='ascii'):        
-        if not os.path.exists(filepath):
-            raise ValueError('File for reading list does NOT exist: ' + filepath)
-        
-        linelist = []        
-        if encoding == 'ascii':
-            transform = lambda line: line.encode()
-        else:
-            transform = lambda line: line 
-
-        with io.open(filepath, encoding=encoding) as stream:            
-            for line in stream:
-                line = transform(line.strip())
-                if line != '':
-                    linelist.append(line)                    
-        return linelist
-
-    @staticmethod
-    def write_list(file_path, line_list, encoding='ascii', 
-                   append=False, verbose=False):
-        '''
-        Writes a list into the given file object
-        
-        file_path: the file path that will be written to
-        line_list: the list of strings that will be written
-        '''                
-        mode = 'w'
-        if append:
-            mode = 'a'
-        
-        with io.open(file_path, mode, encoding=encoding) as f:
-            if verbose:
-                line_list = tqdm.tqdm(line_list)
-              
-            for l in line_list:
-                #f.write(unicode(l) + '\n')   Python 2
-                f.write(l + '\n')
-
-
-class IAMDataset_style(WordLineDataset):
-    def __init__(self, basefolder, subset, segmentation_level, fixed_size, transforms):
-        super().__init__(basefolder, subset, segmentation_level, fixed_size, transforms)
-        self.setname = 'IAM'
-        self.trainset_file = '{}/{}/set_split/trainset.txt'.format(self.basefolder, self.setname)
-        self.valset_file = '{}/{}/set_split/validationset1.txt'.format(self.basefolder, self.setname)
-        self.testset_file = '{}/{}/set_split/testset.txt'.format(self.basefolder, self.setname)
-        self.line_file = '{}/ascii/lines.txt'.format(self.basefolder, self.setname)
-        self.word_file = './iam_data/ascii/words.txt'.format(self.basefolder, self.setname)
-        self.word_path = '{}/words'.format(self.basefolder, self.setname)
-        self.line_path = '{}/lines'.format(self.basefolder, self.setname)
-        self.forms = './iam_data/ascii/forms.txt'
-        #self.stopwords_path = '{}/{}/iam-stopwords'.format(self.basefolder, self.setname)
-        super().__finalize__()
-
-    def main_loader(self, subset, segmentation_level) -> list:
-        def gather_iam_info(self, set='train', level='word'):
-            if subset == 'train':
-                #valid_set = np.loadtxt(self.trainset_file, dtype=str)
-                valid_set = np.loadtxt('./utils/aachen_iam_split/train_val.uttlist', dtype=str)
-                #print(valid_set)
-            elif subset == 'val':
-                #valid_set = np.loadtxt(self.valset_file, dtype=str)
-                valid_set = np.loadtxt('./utils/aachen_iam_split/validation.uttlist', dtype=str)
-            elif subset == 'test':
-                #valid_set = np.loadtxt(self.testset_file, dtype=str)
-                valid_set = np.loadtxt('./utils/aachen_iam_split/test.uttlist', dtype=str)
-            else:
-                raise ValueError
-            if level == 'word':
-                gtfile= self.word_file
-                root_path = self.word_path
-                print('root_path', root_path)
-                forms = self.forms
-            elif level == 'line':
-                gtfile = self.line_file
-                root_path = self.line_path
-            else:
-                raise ValueError
-            gt = []
-            form_writer_dict = {}
-            
-            dict_path = f'./writers_dict_{subset}.json'
-            #open dict file
-            with open(dict_path, 'r') as f:
-                wr_dict = json.load(f)
-            for l in open(forms):
-                if not l.startswith("#"):
-                    info = l.strip().split()
-                    #print('info', info)
-                    form_name = info[0]
-                    writer_name = info[1]
-                    form_writer_dict[form_name] = writer_name
-                    #print('form_writer_dict', form_writer_dict)
-                    #print('form_name', form_name)
-                    #print('writer', writer_name)
-            
-            for line in open(gtfile):
-                if not line.startswith("#"):
-                    info = line.strip().split()
-                    name = info[0]
-                    name_parts = name.split('-')
-                    pathlist = [root_path] + ['-'.join(name_parts[:i+1]) for i in range(len(name_parts))]
-                    #print('name', name)
-                    #form =
-                    #writer_name = name_parts[1]
-                    #print('writer_name', writer_name)
-                    
-                    if level == 'word':
-                        line_name = pathlist[-2]
-                        del pathlist[-2]
-
-                        if (info[1] != 'ok'):
-                            continue
-
-                    elif level == 'line':
-                        line_name = pathlist[-1]
-                    form_name = '-'.join(line_name.split('-')[:-1])
-                    #print('form_name', form_name)
-                    #if (info[1] != 'ok') or (form_name not in valid_set):
-                    if (form_name not in valid_set):
-                        #print(line_name)
-                        continue
-                    img_path = '/'.join(pathlist)
-                    
-                    transcr = ' '.join(info[8:])
-                    writer_name = form_writer_dict[form_name]
-                    #print('writer_name', writer_name)
-                    writer_name = wr_dict[writer_name]
-                    
-                    gt.append((img_path, transcr, writer_name))
-            return gt
-
-        info = gather_iam_info(self, subset, segmentation_level)
-        data = []
-        widths = []
-        for i, (img_path, transcr, writer_name) in enumerate(info):
-            if i % 1000 == 0:
-                print('imgs: [{}/{} ({:.0f}%)]'.format(i, len(info), 100. * i / len(info)))
-            #
-
-            try:
-                #print('img_path', img_path + '.png')
-                img = Image.open(img_path + '.png').convert('RGB') #.convert('L')
-                #print('img shape PIL', img.size)
-                #img = image_resize_PIL(img, height=64)
-                
-                if img.height < 64 and img.width < 256:
-                    img = img
-                else:
-                    img = image_resize_PIL(img, height=img.height // 2)
-                
-                #widths.append(img.size[0])
-                
-            except:
-               continue
-                
-            #except:
-            #    print('Could not add image file {}.png'.format(img_path))
-            #    continue
-
-            # transform iam transcriptions
-            transcr = transcr.replace(" ", "")
-            # "We 'll" -> "We'll"
-            special_cases  = ["s", "d", "ll", "m", "ve", "t", "re"]
-            # lower-case 
-            for cc in special_cases:
-                transcr = transcr.replace("|\'" + cc, "\'" + cc)
-                transcr = transcr.replace("|\'" + cc.upper(), "\'" + cc.upper())
-
-            transcr = transcr.replace("|", " ")
-            
-            data += [(img, transcr, writer_name, img_path)]
-            
-        return data
-
-    
-    
 class Mixed_Encoder(nn.Module):
     """
     Encode images to a fixed size vector
     """
 
     def __init__(
-        self, model_name='resnet50', num_classes=339, pretrained=True, trainable=True
+        self, model_name='mobilenetv2_100', num_classes=302, pretrained=True, trainable=True
     ):
         super().__init__()
         self.model = timm.create_model(
@@ -713,6 +65,7 @@ class Mixed_Encoder(nn.Module):
 
         for p in self.model.parameters():
             p.requires_grad = trainable
+
     def forward(self, x):
         # Extract features
         features = self.model(x)
@@ -725,7 +78,6 @@ class Mixed_Encoder(nn.Module):
         # print('logits', logits.shape)
         # print('pooled_features', pooled_features.shape)
         return logits, pooled_features  
-
 
 #================ Performance and Loss Function ========================
 def performance(pred, label):
@@ -748,21 +100,20 @@ def train_class_epoch(model, training_data, optimizer, args):
     for i, data in enumerate(pbar):
     
         image = data[0].to(args.device)
-        if args.dataset == 'iam':
-            label = data[2].to(args.device)
+        labels = torch.tensor([int(l) for l in data[3]]).to(args.device)
         
         optimizer.zero_grad()
 
-        output = model(image)
+        output, _ = model(image)  # Use logits
         
-        loss = performance(output, label)
+        loss = performance(output, labels)
         _, preds = torch.max(output.data, 1)
  
         loss.backward()
         optimizer.step()
         total_loss += loss.item() 
-        total += label.size(0)
-        n_corrects += (preds == label).sum().item()
+        total += labels.size(0)
+        n_corrects += (preds == labels).sum().item()
         pbar.set_postfix(Loss=loss.item())
         
     loss = total_loss/total
@@ -784,18 +135,17 @@ def eval_class_epoch(model, validation_data, args):
         for i, data in enumerate(tqdm(validation_data)):
 
             image = data[0].to(args.device)   
-            image_paths = data[4]
-            if args.dataset == 'iam':
-                label = data[2].to(args.device)
+            image_paths = data[8]
+            labels = torch.tensor([int(l) for l in data[3]]).to(args.device)
 
-            output = model(image)
+            output, _ = model(image)  # Use logits
             
-            loss = performance(output, label)  #performance
+            loss = performance(output, labels)  #performance
             _, preds = torch.max(output.data, 1)
             
             total_loss += loss.item()
-            n_corrects += (preds == label.data).sum().item()
-            total += label.size(0)
+            n_corrects += (preds == labels.data).sum().item()
+            total += labels.size(0)
             #prediction_list.append(preds)
             #write into a file the img_path and the prediction
             # with open('predictions.txt', 'a') as f:
@@ -822,21 +172,16 @@ def train_epoch_triplet(train_loader, model, criterion, optimizer, device, args)
         
         img = data[0]
     
-        if args.dataset == 'iam':
-            wid = data[2]
-            #print('wid', wid)
-            positive = data[3]
-            negative = data[4]
+        positive = data[4].to(device)
+        negative = data[5].to(device)
         
         anchor = img.to(device)
-        positive = positive.to(device)
-        negative = negative.to(device)
 
-        anchor_out = model(anchor)
-        positive_out = model(positive)
-        negative_out = model(negative)
+        _, anchor_features = model(anchor)  # Use features
+        _, positive_features = model(positive)
+        _, negative_features = model(negative)
         
-        loss = criterion(anchor_out, positive_out, negative_out)
+        loss = criterion(anchor_features, positive_features, negative_features)
         
         optimizer.zero_grad()
         loss.backward()
@@ -862,27 +207,22 @@ def val_epoch_triplet(val_loader, model, criterion, optimizer, device, args):
     for i, data in enumerate(pbar):
         
         img = data[0]
-        #transcr = data[1]
 
-        if args.dataset == 'iam':
-            wid = data[2]
-            positive = data[3]
-            negative = data[4]
+        positive = data[4].to(device)
+        negative = data[5].to(device)
        
         anchor = img.to(device)
-        positive = positive.to(device)
-        negative = negative.to(device)
     
-        anchor_out = model(anchor)
-        positive_out = model(positive)
-        negative_out = model(negative)
+        _, anchor_features = model(anchor)  # Use features
+        _, positive_features = model(positive)
+        _, negative_features = model(negative)
         
-        loss = criterion(anchor_out, positive_out, negative_out)
+        loss = criterion(anchor_features, positive_features, negative_features)
         
         #running_loss.append(loss.cpu().detach().numpy())
         running_loss += loss.item()
         pbar.set_postfix(triplet_loss=loss.item())
-        total += wid.size(0)
+        total += img.size(0)
     
     print('total', total)
     print("Validation Loss: {:.4f}".format(running_loss/len(val_loader)))
@@ -904,7 +244,7 @@ def train_epoch_mixed(train_loader, model, criterion_triplet, criterion_classifi
     for i, data in enumerate(pbar):
         
         img = data[0]
-        wid = data[3].to(device)
+        wids = torch.tensor([int(w) for w in data[3]]).to(device)
         positive = data[4].to(device)
         negative = data[5].to(device)
         
@@ -915,9 +255,9 @@ def train_epoch_mixed(train_loader, model, criterion_triplet, criterion_classifi
         _, negative_features = model(negative)
         
         _, preds = torch.max(anchor_logits.data, 1)
-        n_corrects += (preds == wid.data).sum().item()
+        n_corrects += (preds == wids).sum().item()
     
-        classification_loss = performance(anchor_logits, wid)
+        classification_loss = performance(anchor_logits, wids)
         triplet_loss = criterion_triplet(anchor_features, positive_features, negative_features)
         
         
@@ -953,7 +293,7 @@ def val_epoch_mixed(val_loader, model, criterion_triplet, criterion_classificati
     for i, data in enumerate(pbar):
         
         img = data[0].to(device)
-        wid = data[3].to(device)
+        wids = torch.tensor([int(w) for w in data[3]]).to(device)
         positive = data[4].to(device)
         negative = data[5].to(device)
         
@@ -963,9 +303,9 @@ def val_epoch_mixed(val_loader, model, criterion_triplet, criterion_classificati
         _, negative_features = model(negative)
         
         _, preds = torch.max(anchor_logits.data, 1)
-        n_corrects += (preds == wid.data).sum().item()
+        n_corrects += (preds == wids).sum().item()
     
-        classification_loss = performance(anchor_logits, wid)
+        classification_loss = performance(anchor_logits, wids)
         triplet_loss = criterion_triplet(anchor_features, positive_features, negative_features)
         
         loss = classification_loss + triplet_loss
@@ -975,7 +315,7 @@ def val_epoch_mixed(val_loader, model, criterion_triplet, criterion_classificati
         count = img.size(0)
         loss_meter.update(loss.item(), count)
         pbar.set_postfix(mixed_loss=loss_meter.avg)
-        total += wid.size(0)
+        total += wids.size(0)
     
     print('total', total)
     accuracy = n_corrects/total
@@ -1113,7 +453,7 @@ def main():
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ])
-        train_data = myDataset(dataset_folder, 'train', 'line', fixed_size=(1 * 64, 256), transforms=train_transform)
+        train_data = myDataset(dataset_folder, 'train', 'line', fixed_size=(64, 256), transforms=train_transform)
         validation_size = int(0.2 * len(train_data))
         train_size = len(train_data) - validation_size
         train_data, val_data = random_split(train_data, [train_size, validation_size], generator=torch.Generator().manual_seed(42))
@@ -1128,8 +468,17 @@ def main():
     # Model setup
     if args.model == 'mobilenetv2_100':
         print('Using mobilenetv2_100')
-        model = ImageEncoder(model_name='mobilenetv2_100', num_classes=style_classes, pretrained=True, trainable=True)
+        model = Mixed_Encoder(model_name='mobilenetv2_100', num_classes=style_classes, pretrained=True, trainable=True)
         print('Number of model parameters: {}'.format(sum([p.data.nelement() for p in model.parameters()])))
+
+    if args.pretrained == True:
+        PATH = args.style_path  # Define PATH if needed
+        state_dict = torch.load(PATH, map_location=device)
+        model_dict = model.state_dict()
+        state_dict = {k: v for k, v in state_dict.items() if k in model_dict and model_dict[k].shape == v.shape}
+        model_dict.update(state_dict)
+        model.load_state_dict(model_dict)
+        print('Pretrained model loaded')
 
     model = model.to(device)
     optimizer_ft = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)

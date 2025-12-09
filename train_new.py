@@ -17,21 +17,17 @@ from unet import UNetModel
 import wandb
 from torchvision import transforms
 from feature_extractor import ImageEncoder
-from unhd_dataset import UNHDDataset  # Import UNHD dataset
-from auxiliary_functions import *
+from utils.unhd_dataset import UNHDDataset # Import UNHD dataset
+from utils.auxilary_functions import *
 from torchvision.utils import save_image
 from torch.nn import DataParallel
 from transformers import CanineModel, CanineTokenizer
-
 torch.cuda.empty_cache()
-
-OUTPUT_MAX_LEN = 95  # +2  # <GO>+groundtruth+<END>
+OUTPUT_MAX_LEN = 95 # +2 # <GO>+groundtruth+<END>
 IMG_WIDTH = 256
 IMG_HEIGHT = 64
-
 # For Urdu, character classes are auto-computed in dataset
 # No fixed c_classes, use dataset.character_classes
-
 ### Borrowed from GANwriting ###
 def label_padding(labels, num_tokens):
     new_label_len = []
@@ -42,26 +38,22 @@ def label_padding(labels, num_tokens):
     # ll = [tokens["GO_TOKEN"]] + ll + [tokens["END_TOKEN"]]
     num = OUTPUT_MAX_LEN - len(ll)
     if not num == 0:
-        ll.extend([tokens["PAD_TOKEN"]] * num)  # replace PAD_TOKEN
+        ll.extend([tokens["PAD_TOKEN"]] * num) # replace PAD_TOKEN
     return ll
-
 def labelDictionary():
     # Use dataset's character_classes
     return len(labels), letter2index, index2letter
-
 tok = False
 if not tok:
     tokens = {"PAD_TOKEN": 52}
 else:
     tokens = {"GO_TOKEN": 52, "END_TOKEN": 53, "PAD_TOKEN": 54}
 num_tokens = len(tokens.keys())
-
 def setup_logging(args):
     # os.makedirs("models", exist_ok=True)
     os.makedirs(args.save_path, exist_ok=True)
     os.makedirs(os.path.join(args.save_path, 'models'), exist_ok=True)
     os.makedirs(os.path.join(args.save_path, 'images'), exist_ok=True)
-
 def save_images(images, path, args, **kwargs):
     # print('image', images.shape)
     grid = torchvision.utils.make_grid(images, padding=0, **kwargs)
@@ -76,7 +68,6 @@ def save_images(images, path, args, **kwargs):
         im = Image.fromarray(ndarr)
     im.save(path)
     return im
-
 def crop_whitespace_width(img):
     # tensor image to PIL
     original_height = img.height
@@ -87,24 +78,19 @@ def crop_whitespace_width(img):
     # rect = img.crop((x, 0, x + w, original_height))
     rect = img.crop((x, y, x + w, y + h))
     return np.array(rect)
-
 class AvgMeter:
     def __init__(self, name="Metric"):
         self.name = name
         self.reset()
-
     def reset(self):
         self.avg, self.sum, self.count = [0] * 3
-
     def update(self, val, count=1):
         self.count += count
         self.sum += val * count
         self.avg = self.sum / self.count
-
     def __repr__(self):
         text = f"{self.name}: {self.avg:.4f}"
         return text
-
 class EMA:
     ''' EMA is used to stabilize the training process of diffusion models by
     computing a moving average of the parameters, which can help to reduce the noise in the gradients
@@ -114,17 +100,14 @@ class EMA:
         super().__init__()
         self.beta = beta
         self.step = 0
-
     def update_model_average(self, ma_model, current_model):
         for current_params, ma_params in zip(current_model.parameters(), ma_model.parameters()):
             old_weight, up_weight = ma_params.data, current_params.data
             ma_params.data = self.update_average(old_weight, up_weight)
-
     def update_average(self, old, new):
         if old is None:
             return new
         return old * self.beta + (1 - self.beta) * new
-
     def step_ema(self, ema_model, model, step_start_ema=2000):
         if self.step < step_start_ema:
             self.reset_parameters(ema_model, model)
@@ -132,10 +115,8 @@ class EMA:
             return
         self.update_model_average(ema_model, model)
         self.step += 1
-
     def reset_parameters(self, ema_model, model):
         ema_model.load_state_dict(model.state_dict())
-
 class Diffusion:
     def __init__(self, noise_steps=1000, beta_start=1e-4, beta_end=0.02, img_size=(64, 256), args=None):
         self.noise_steps = noise_steps
@@ -146,13 +127,10 @@ class Diffusion:
         self.alpha_hat = torch.cumprod(self.alpha, dim=0)
         self.img_size = img_size
         self.device = args.device
-
     def prepare_noise_schedule(self):
         return torch.linspace(self.beta_start, self.beta_end, self.noise_steps)
-
     def sample_timesteps(self, n):
         return torch.randint(low=1, high=self.noise_steps, size=(n,))
-
     def sampling_loader(self, model, test_loader, vae, n, x_text, labels, args, style_extractor, noise_scheduler, mix_rate=None, cfg_scale=3, transform=None, character_classes=None, tokenizer=None, text_encoder=None):
         model.eval()
         tensor_list = []
@@ -162,10 +140,10 @@ class Diffusion:
             for i, data in enumerate(pbar):
                 images = data[0].to(args.device)
                 transcr = data[1]
-                s_id = data[2].to(args.device)
-                style_images = data[3].to(args.device)
+                s_id = torch.tensor([int(w) for w in data[3]]).to(args.device)  # wid is data[3]
+                style_images = data[7].to(args.device)
                 cor_im = data[5].to(args.device)
-                img_path = data[4]
+                img_path = data[8]
                 if args.model_name == 'wordstylist':
                     # print('transcr', transcr)
                     batch_word_embeddings = []
@@ -208,16 +186,14 @@ class Diffusion:
             x = (x.clamp(-1, 1) + 1) / 2
             x = (x * 255).type(torch.uint8)
         return x
-
     def sampling(self, model, vae, n, x_text, labels, args, style_extractor, noise_scheduler, mix_rate=None, cfg_scale=3, transform=None, character_classes=None, tokenizer=None, text_encoder=None, run_idx=None):
         model.eval()
         tensor_list = []
         with torch.no_grad():
             style_images = None
-            text_features = x_text  # [x_text]*n
+            text_features = x_text # [x_text]*n
             # print('text features', text_features.shape)
             text_features = tokenizer(text_features, padding="max_length", truncation=True, return_tensors="pt", max_length=40).to(args.device)
-
             if args.img_feat == True:
                 # pick random image according to specific style
                 with open('./writers_dict.json', 'r') as f:
@@ -237,14 +213,18 @@ class Diffusion:
                         five_styles = random.sample(matching_lines, 5)
                     else:
                         matching_lines = [line for line in train_data if line[1] == reverse_wr_dict[label_index]]
-                        five_styles = [matching_lines[0]]*5
-                    cor_image_random = random.sample(matching_lines, 1)
+                        if len(matching_lines) > 0:
+                            five_styles = [matching_lines[0]]*5
+                        else:
+                            # fallback to random samples
+                            five_styles = random.sample(train_data, 5)
+                    cor_image_random = random.sample(matching_lines if matching_lines else train_data, 1)
                     # print('cor_image_random', cor_image_random)
                     fheight, fwidth = 64, 256
                     root_path = './unhd_data/UNHD-Complete-Data'
                     cor_im = False
                     if cor_im == True:
-                        cor_image = Image.open(os.path.join(root_path, cor_image_random[0][0])).convert('RGB')  # ['a05/a05-089/a05-089-00-05.png', '000', 'debate']
+                        cor_image = Image.open(cor_image_random[0][0]).convert('RGB') # ['a05/a05-089/a05-089-00-05.png', '000', 'debate']
                         (cor_image_width, cor_image_height) = cor_image.size
                         cor_image = cor_image.resize((int(cor_image_width * 64 / cor_image_height), 64))
                         (cor_image_width, cor_image_height) = cor_image.size
@@ -265,7 +245,7 @@ class Diffusion:
                     st_imgs = []
                     grid_imgs = []
                     for im_idx, random_f in enumerate(five_styles):
-                        file_path = os.path.join(root_path, random_f[0])
+                        file_path = random_f[0]
                         try:
                             img_s = Image.open(file_path).convert('RGB')
                         except ValueError:
@@ -274,8 +254,8 @@ class Diffusion:
                             # Find a replacement image that is not corrupted
                             replacement_idx = (im_idx + 1) % 5
                             replacement_f = five_styles[replacement_idx]
-                            name = replacement_f[0]  # .split(',')[1]
-                            replacement_file_path = os.path.join(root_path, name)
+                            name = replacement_f[0] # .split(',')[1]
+                            replacement_file_path = name
                             img_s = Image.open(replacement_file_path).convert('RGB')
                         (img_width, img_height) = img_s.size
                         img_s = img_s.resize((int(img_width * 64 / img_height), 64))
@@ -305,13 +285,12 @@ class Diffusion:
                     # save style images
                     style_images = style_images.reshape(-1, 3, 64, 256)
                     style_features = style_extractor(style_images).to(args.device)
-                    # style_features = torch.stack(style_featur, dim=0)  # We get [320, 5, 2048]
+                    # style_features = torch.stack(style_featur, dim=0) # We get [320, 5, 2048]
                     # print('style features', style_features.shape)
                     # style_features = style_features.reshape(n, -1).to(args.device)
                 else:
                     style_images = None
                     style_features = None
-
             if args.latent == True:
                 x = torch.randn((n, 4, self.img_size[0] // 8, self.img_size[1] // 8)).to(args.device)
                 if cor_im == True:
@@ -344,7 +323,6 @@ class Diffusion:
             x = (x.clamp(-1, 1) + 1) / 2
             x = (x * 255).type(torch.uint8)
         return x
-
 def train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss, loader, test_loader, num_classes, style_extractor, vocab_size, noise_scheduler, transforms, args, tokenizer=None, text_encoder=None, lr_scheduler=None):
     model.train()
     loss_meter = AvgMeter()
@@ -356,8 +334,8 @@ def train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss, loader, te
         for i, data in enumerate(pbar):
             images = data[0].to(args.device)
             transcr = data[1]
-            s_id = data[2].to(args.device)
-            style_images = data[3].to(args.device)
+            s_id = torch.tensor([int(w) for w in data[3]]).to(args.device)  # wid is data[3]
+            style_images = data[7].to(args.device) # s_imgs is data[7]
             if args.model_name == 'wordstylist':
                 batch_word_embeddings = []
                 for trans in transcr:
@@ -421,10 +399,16 @@ def train(diffusion, model, ema, ema_model, vae, optimizer, mse_loss, loader, te
             if args.wandb_log==True:
                 wandb_sampled_ema= wandb.Image(sampled_ema, caption=f"{x_text}_{epoch}")
                 wandb.log({f"Sampled images": wandb_sampled_ema})
+            # Generate one Urdu sentence in one style
+            urdu_text = 'کون سوچ سکتا تھا کہ ہندوستان اکثریت اورانگریزحکمرانوں کی مشترکہ'
+            s = 0 # fixed style
+            labels = torch.tensor([s]).long().to(args.device)
+            sample_image = diffusion.sampling(model=ema_model, vae=vae, n=1, x_text=urdu_text, labels=labels, args=args, style_extractor=style_extractor, noise_scheduler=noise_scheduler, transform=transforms, character_classes=None, tokenizer=tokenizer, text_encoder=text_encoder)
+            save_images(sample_image, os.path.join(args.save_path, 'images', f'urdu_sample_epoch_{epoch}_style_{s}.jpg'), args)
+        if epoch==490:
             torch.save(model.state_dict(), os.path.join(args.save_path,"models", "ckpt.pt"))
             torch.save(ema_model.state_dict(), os.path.join(args.save_path,"models", "ema_ckpt.pt"))
             torch.save(optimizer.state_dict(), os.path.join(args.save_path,"models", "optim.pt"))
-
 def main():
     '''Main function'''
     parser = argparse.ArgumentParser()
@@ -432,7 +416,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=320)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--model_name', type=str, default='diffusionpen', help='diffusionpen or wordstylist (previous work)')
-    parser.add_argument('--level', type=str, default='line', help='word, line')  # Changed to line for sentences
+    parser.add_argument('--level', type=str, default='line', help='word, line') # Changed to line for sentences
     parser.add_argument('--img_size', type=int, default=(64, 256))
     parser.add_argument('--dataset', type=str, default='unhd', help='iam, gnhk, unhd')
     # UNET parameters
@@ -463,34 +447,29 @@ def main():
         wandb.config.update(args)
     # create save directories
     setup_logging(args)
-
     ############################ DATASET ############################
     transform = transforms.Compose([
         # transforms.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1), shear=0.1, fill=255),
         transforms.ToTensor(),
-        torchvision.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # transforms.Normalize((0.5,), (0.5,)),
+        torchvision.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)) # transforms.Normalize((0.5,), (0.5,)),
     ])
-    if args.dataset == 'unhd':
-        print('loading UNHD')
-        unhd_folder = './unhd_data/UNHD-Complete-Data'
-        myDataset = UNHDDataset
-        if args.level == 'line':
-            train_data = myDataset(unhd_folder, 'train', 'line', fixed_size=(1 * 64, 256), transforms=transform, args=args)
-        test_data = myDataset(unhd_folder, 'test', 'line', fixed_size=(1 * 64, 256), transforms=transform, args=args)
-        print('train data', len(train_data))
-        test_size = args.batch_size
-        rest = len(train_data) - test_size
-        test_data, _ = random_split(train_data, [test_size, rest], generator=torch.Generator().manual_seed(42))
-        with open('./writers_dict.json', 'r') as f:
-            wr_dict = json.load(f)
-        style_classes = len(wr_dict)
-        character_classes = train_data.character_classes
-        vocab_size = len(character_classes) + num_tokens
-        print('num of character classes', vocab_size)
-
+    unhd_folder = args.dataset
+    myDataset = UNHDDataset
+    if args.level == 'line':
+        train_data = myDataset(unhd_folder, 'train', 'line', fixed_size=(1 * 64, 256), transforms=transform, args=args)
+    test_data = myDataset(unhd_folder, 'test', 'line', fixed_size=(1 * 64, 256), transforms=transform, args=args)
+    print('train data', len(train_data))
+    test_size = args.batch_size
+    rest = len(train_data) - test_size
+    test_data, _ = random_split(train_data, [test_size, rest], generator=torch.Generator().manual_seed(42))
+    with open('./writers_dict.json', 'r') as f:
+        wr_dict = json.load(f)
+    style_classes = len(wr_dict)
+    character_classes = train_data.character_classes
+    vocab_size = len(character_classes) + num_tokens
+    print('num of character classes', vocab_size)
     train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=4)
     test_loader = DataLoader(test_data, batch_size=args.batch_size, shuffle=False, num_workers=4)
-
     ######################### MODEL #######################################
     if args.model_name == 'wordstylist':
         vocab_size = len(character_classes) + 2
@@ -498,14 +477,12 @@ def main():
     else:
         vocab_size = len(character_classes)
     print('Vocab size: ', vocab_size)
-
     if args.dataparallel==True:
         device_ids = [3,4]
         print('using dataparallel with device:', device_ids)
     else:
         idx = int(''.join(filter(str.isdigit, args.device)))
         device_ids = [idx]
-
     if args.model_name == 'diffusionpen':
         tokenizer = CanineTokenizer.from_pretrained("google/canine-c")
         text_encoder = CanineModel.from_pretrained("google/canine-c")
@@ -514,28 +491,24 @@ def main():
     else:
         tokenizer = CanineTokenizer.from_pretrained("google/canine-c")
         text_encoder = None
-
     if args.unet=='unet_latent':
         unet = UNetModel(image_size = args.img_size, in_channels=args.channels, model_channels=args.emb_dim, out_channels=args.channels, num_res_blocks=args.num_res_blocks, attention_resolutions=(1,1), channel_mult=(1, 1), num_heads=args.num_heads, num_classes=style_classes, context_dim=args.emb_dim, vocab_size=vocab_size, text_encoder=text_encoder, args=args)#.to(args.device)
         unet = DataParallel(unet, device_ids=device_ids)
         unet = unet.to(args.device)
         # print('unet parameters')
         # print('unet', sum(p.numel() for p in unet.parameters() if p.requires_grad))
-
     optimizer = optim.AdamW(unet.parameters(), lr=0.0001)
     lr_scheduler = None
     mse_loss = nn.MSELoss()
     diffusion = Diffusion(img_size=args.img_size, args=args)
     ema = EMA(0.995)
     ema_model = copy.deepcopy(unet).eval().requires_grad_(False)
-
     # load from last checkpoint
     if args.load_check==True:
         unet.load_state_dict(torch.load(f'{args.save_path}/models/ckpt.pt'))
         optimizer.load_state_dict(torch.load(f'{args.save_path}/models/optim.pt'))
         ema_model.load_state_dict(torch.load(f'{args.save_path}/models/ema_ckpt.pt'))
         print('Loaded models and optimizer')
-
     if args.latent==True:
         print('VAE is true')
         vae = AutoencoderKL.from_pretrained(args.stable_dif_path, subfolder="vae")
@@ -545,14 +518,12 @@ def main():
         vae.requires_grad_(False)
     else:
         vae = None
-
     # add DDIM scheduler from huggingface
     ddim = DDIMScheduler.from_pretrained(args.stable_dif_path, subfolder="scheduler")
-
     #### STYLE ####
     feature_extractor = ImageEncoder(model_name='mobilenetv2_100', num_classes=0, pretrained=True, trainable=True)
     PATH = args.style_path
-    state_dict = torch.load(PATH, map_location=args.device)
+    state_dict = torch.load(PATH, map_location=args.device, weights_only=True)
     model_dict = feature_extractor.state_dict()
     state_dict = {k: v for k, v in state_dict.items() if k in model_dict and model_dict[k].shape == v.shape}
     model_dict.update(state_dict)
@@ -561,7 +532,6 @@ def main():
     feature_extractor = feature_extractor.to(args.device)
     feature_extractor.requires_grad_(False)
     feature_extractor.eval()
-
     if args.train_mode == 'train':
         train(diffusion, unet, ema, ema_model, vae, optimizer, mse_loss, train_loader, test_loader, style_classes, feature_extractor, vocab_size, ddim, transform, args, tokenizer=tokenizer, text_encoder=text_encoder, lr_scheduler=lr_scheduler)
     elif args.train_mode == 'sampling':
@@ -574,10 +544,10 @@ def main():
         ema_model.load_state_dict(torch.load(f'{args.save_path}/models/ema_ckpt.pt'))
         ema_model.eval()
         if args.sampling_mode == 'single_sampling':
-            x_text = ['کون', 'سوچ']  # Urdu text examples
+            x_text = ['کون', 'سوچ'] # Urdu text examples
             for x_text in x_text:
                 print('Word:', x_text)
-                s = random.randint(0, style_classes - 1)  # index for style class
+                s = random.randint(0, style_classes - 1) # index for style class
                 print('style', s)
                 labels = torch.tensor([s]).long().to(args.device)
                 ema_sampled_images = diffusion.sampling(ema_model, vae, n=len(labels), x_text=x_text, labels=labels, args=args, style_extractor=feature_extractor, noise_scheduler=ddim, transform=transform, character_classes=None, tokenizer=tokenizer, text_encoder=text_encoder, run_idx=None)
@@ -585,7 +555,7 @@ def main():
         elif args.sampling_mode == 'paragraph':
             print('Sampling paragraph')
             #make the code to generate lines
-            lines = 'کون سوچ سکتا تھا کہ ہندوستان اکثریت اورانگریزحکمرانوں کی مشترکہ مخالفت کےباوجود برصغیرکی ملت اسلامیہ دین اسلام ہے اور اسی نظریہ پر اس ملک میں بسنے والے مختلف عناصر کا اتحاد ہےاورپاکستان کی بقاء اسی نظریہ حیات کے فروغ پر منحصر ہے۔'  # Example Urdu text
+            lines = 'کون سوچ سکتا تھا کہ ہندوستان اکثریت اورانگریزحکمرانوں کی مشترکہ مخالفت کےباوجود برصغیرکی ملت اسلامیہ دین اسلام ہے اور اسی نظریہ پر اس ملک میں بسنے والے مختلف عناصر کا اتحاد ہےاورپاکستان کی بقاء اسی نظریہ حیات کے فروغ پر منحصر ہے۔' # Example Urdu text
             fakes= []
             gap = np.ones((64, 16)) * 255
             max_line_width = 900
@@ -597,7 +567,7 @@ def main():
             #print('longest_word_length', longest_word_length)
             s = random.randint(0, style_classes - 1)#.long().to(args.device)
             print('Style:', s)
-            words = words[::-1]  # Reverse for RTL
+            words = words[::-1] # Reverse for RTL
             for word in words:
                 print('Word:', word)
                 labels = torch.tensor([s]).long().to(args.device)
@@ -617,11 +587,11 @@ def main():
             #find the average character width of the max length word
             avg_char_width = max_word_length_width / longest_word_length
             print('avg_char_width', avg_char_width)
-            #scaling_factor = avg_char_width / (32 * aspect_ratio)  # Aspect ratio of an average character
+            #scaling_factor = avg_char_width / (32 * aspect_ratio) # Aspect ratio of an average character
             # Scale and pad each word
             scaled_padded_words = []
-            max_height = 64  # Defined max height for all images
-            punctuation = '.,?!:;،۔؟'  # Added Urdu punctuation
+            max_height = 64 # Defined max height for all images
+            punctuation = '.,?!:;،۔؟' # Added Urdu punctuation
             for word, img in zip(words, fakes):
                 img_pil = Image.fromarray(img)
                 as_ratio = img_pil.width / img_pil.height
@@ -662,13 +632,13 @@ def main():
                     #print('padded_img', padded_img.shape)
                 scaled_padded_words.append(padded_img)
             # Create a gap array (white space)
-            height = 64  # Fixed height for all images
-            gap = np.ones((height, 16), dtype=np.uint8) * 255  # White gap
+            height = 64 # Fixed height for all images
+            gap = np.ones((height, 16), dtype=np.uint8) * 255 # White gap
             # Concatenate images with gaps
-            sentence_img = gap  # Start with a gap
+            sentence_img = gap # Start with a gap
             lines = []
             line_img = gap
-            ''' sentence_img = gap  # Start with a gap
+            ''' sentence_img = gap # Start with a gap
             for img in scaled_padded_words:
                 #print('img', img.shape)
                 sentence_img = np.concatenate((sentence_img, img, gap), axis=1) '''
@@ -677,7 +647,7 @@ def main():
                 if current_line_width + img_width < max_line_width:
                     # Add the image to the current line
                     if line_img.shape[0] == 0:
-                        line_img = np.ones((height, 0), dtype=np.uint8) * 255  # Start a new line
+                        line_img = np.ones((height, 0), dtype=np.uint8) * 255 # Start a new line
                     line_img = np.concatenate((line_img, img, gap), axis=1)
                     current_line_width += img_width #+ gap.shape[1]
                     #print('current_line_width if', current_line_width)
@@ -701,16 +671,15 @@ def main():
             # max_height = max([line.shape[0] for line in lines])
             # paragraph_img = np.ones((0, max_line_width), dtype=np.uint8) * 255
             # for line in lines:
-            #     if line.shape[0] < max_height:
-            #         padding = (max_height - line.shape[0]) // 2
-            #         line = np.pad(line, ((padding, max_height - line.shape[0] - padding), (0, 0)), mode='constant', constant_values=255)
-            #     #print the shapes
+            # if line.shape[0] < max_height:
+            # padding = (max_height - line.shape[0]) // 2
+            # line = np.pad(line, ((padding, max_height - line.shape[0] - padding), (0, 0)), mode='constant', constant_values=255)
+            # #print the shapes
             # print('line shape', line.shape)
             #print('paragraph shape', paragraph_img.shape)
             paragraph_img = np.concatenate(lines, axis=0)
             paragraph_image = Image.fromarray(paragraph_img)
             paragraph_image = paragraph_image.convert("L")
             paragraph_image.save(f'paragraph_style_{s}.png')
-
 if __name__ == "__main__":
     main()
