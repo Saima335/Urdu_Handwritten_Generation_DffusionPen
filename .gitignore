@@ -1,0 +1,7 @@
+unhd_data/archive.zip
+unhd_data/
+*.zip
+*.tar
+*.tar.gz
+*.pt
+*.ckpt
